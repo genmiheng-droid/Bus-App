@@ -25,12 +25,17 @@ function getLtaAccountKey(): string {
 }
 
 // Health & Config status endpoint
-app.get('/api/health', (req, res) => {
-  res.json({
+export function healthHandler(req: any, res: any) {
+  res.status(200).json({
     status: 'ok',
     ltaConfigured: Boolean(getLtaAccountKey()),
     timestamp: new Date().toISOString(),
   });
+}
+
+app.get('/api/health', healthHandler);
+app.get('/api', (req, res) => {
+  res.status(200).json({ status: 'ok' });
 });
 
 app.get('/api/lta/status', (req, res) => {
