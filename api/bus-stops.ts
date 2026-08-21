@@ -2,20 +2,20 @@ import { getLtaAccountKey } from '../src/server/ltaService';
 
 export default async function handler(req: any, res: any) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-store');
-
+  const skip = req.query.$skip || req.query.skip || '0';
   const accountKey = getLtaAccountKey();
+
   if (!accountKey) {
     return res.status(200).json({
       isLive: false,
       requiresAccountKey: true,
-      message: 'Configure LTA_DATAMALL_ACCOUNT_KEY on Vercel or .env',
+      message: 'Set LTA_DATAMALL_ACCOUNT_KEY in Vercel environment variables to fetch direct LTA BusStops dataset.',
       value: [],
     });
   }
 
   try {
-    const response = await fetch('https://datamall2.mytransport.sg/ltaodataservice/TrafficIncidents', {
+    const response = await fetch(`https://datamall2.mytransport.sg/ltaodataservice/BusStops?$skip=${encodeURIComponent(skip)}`, {
       method: 'GET',
       headers: {
         AccountKey: accountKey,
@@ -24,22 +24,12 @@ export default async function handler(req: any, res: any) {
     });
 
     if (!response.ok) {
-      return res.status(response.status).json({
-        error: `LTA Traffic Incidents: ${response.statusText}`,
-        value: [],
-      });
+      return res.status(response.status).json({ error: response.statusText, value: [] });
     }
 
     const data = await response.json();
-    return res.status(200).json({
-      isLive: true,
-      timestamp: new Date().toISOString(),
-      value: data.value || [],
-    });
+    return res.status(200).json(data);
   } catch (err: any) {
-    return res.status(500).json({
-      error: err.message,
-      value: [],
-    });
+    return res.status(500).json({ error: err.message, value: [] });
   }
 }

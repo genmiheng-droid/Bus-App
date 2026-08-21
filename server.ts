@@ -3,6 +3,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
+import {
+  getLtaAccountKey,
+  getLtaConfigStatus,
+  getLiveBusArrival,
+  generateRealtimeArrivals,
+} from './src/server/ltaService';
 
 dotenv.config();
 
@@ -14,21 +20,15 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Helper to get LTA DataMall Account Key
-function getLtaAccountKey(): string {
-  return (
-    process.env.LTA_DATAMALL_ACCOUNT_KEY ||
-    process.env.LTA_ACCOUNT_KEY ||
-    process.env.DATAMALL_ACCOUNT_KEY ||
-    ''
-  ).trim();
-}
-
-// Health & Config status endpoint
+// 1. Health & Config status endpoint (References Vercel & runtime environment variables)
 export function healthHandler(req: any, res: any) {
+  const status = getLtaConfigStatus();
   res.status(200).json({
     status: 'ok',
-    ltaConfigured: Boolean(getLtaAccountKey()),
+    ltaConfigured: status.configured,
+    environment: status.environment,
+    accountKeyEnvName: status.accountKeyEnvName,
+    instructions: status.instructions,
     timestamp: new Date().toISOString(),
   });
 }
@@ -38,155 +38,33 @@ app.get('/api', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
-app.get('/api/lta/status', (req, res) => {
-  const accountKey = getLtaAccountKey();
-  res.json({
-    configured: Boolean(accountKey),
-    keyPrefix: accountKey ? `${accountKey.slice(0, 4)}...` : null,
-    endpoints: {
-      busArrivalV3: 'https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival',
-      trafficIncidents: 'https://datamall2.mytransport.sg/ltaodataservice/TrafficIncidents',
-      trainServiceAlerts: 'https://datamall2.mytransport.sg/ltaodataservice/TrainServiceAlerts',
-    },
-  });
+// 2. LTA DataMall Configuration & Diagnostics endpoint
+app.get(['/api/lta/status', '/api/lta-status'], (req, res) => {
+  const status = getLtaConfigStatus();
+  res.json(status);
 });
 
-// Helper to map LTA bus load code
-function mapLoad(load?: string): { occupancy: 'seats' | 'standing' | 'limited'; percent: number } {
-  switch (load) {
-    case 'SEA': // Seats Available
-      return { occupancy: 'seats', percent: 35 };
-    case 'SDA': // Standing Available
-      return { occupancy: 'standing', percent: 68 };
-    case 'LSD': // Limited Standing
-      return { occupancy: 'limited', percent: 92 };
-    default:
-      return { occupancy: 'seats', percent: 30 };
-  }
-}
-
-// Helper to map LTA bus type code
-function mapType(type?: string): 'Single' | 'Double Deck' | 'Bendy' {
-  switch (type) {
-    case 'DD':
-      return 'Double Deck';
-    case 'BD':
-      return 'Bendy';
-    case 'SD':
-    default:
-      return 'Single';
-  }
-}
-
-// Helper to calculate minutes to arrival
-function calculateMinutes(estimatedArrivalIso?: string): number {
-  if (!estimatedArrivalIso) return -1;
-  const arrivalTime = new Date(estimatedArrivalIso).getTime();
-  if (isNaN(arrivalTime)) return -1;
-  const now = Date.now();
-  const diffMs = arrivalTime - now;
-  const diffMinutes = Math.round(diffMs / 60000);
-  return diffMinutes < 0 ? 0 : diffMinutes;
-}
-
-// 1. Bus Arrivals v3 Proxy (20-second live refresh)
-// Usage: /api/lta/bus-arrival?BusStopCode=83139&ServiceNo=15 (or raw=true)
+// 3. Real-Time Bus Arrivals v3 Proxy
 export async function busArrivalHandler(req: any, res: any) {
-  const busStopCode = (req.query?.BusStopCode || req.params?.BusStopCode || '83139').toString().trim();
-  const serviceNo = (req.query?.ServiceNo || req.params?.ServiceNo || '').toString().trim();
+  const busStopCode = (req.query?.BusStopCode || req.query?.busStopCode || req.params?.BusStopCode || '12029').toString().trim();
+  const serviceNo = (req.query?.ServiceNo || req.query?.serviceNo || req.params?.ServiceNo || '').toString().trim();
   const isRaw = req.query?.raw === 'true' || req.path?.includes('raw');
 
-  const accountKey = getLtaAccountKey();
-
-  if (!accountKey) {
+  try {
+    const result = await getLiveBusArrival(busStopCode, serviceNo || undefined);
+    if (isRaw && result.raw) {
+      return res.status(200).json(result.raw);
+    }
+    return res.status(200).json(result);
+  } catch (err: any) {
+    console.error('Error fetching LTA Bus Arrival:', err);
     return res.status(200).json({
       BusStopCode: busStopCode,
       isLive: false,
-      requiresAccountKey: true,
-      message: 'LTA_ACCOUNT_KEY is not set in environment.',
-      Services: [],
-    });
-  }
-
-  try {
-    let ltaUrl = `https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival?BusStopCode=${encodeURIComponent(busStopCode)}`;
-    if (serviceNo) {
-      ltaUrl += `&ServiceNo=${encodeURIComponent(serviceNo)}`;
-    }
-
-    const response = await fetch(ltaUrl, {
-      method: 'GET',
-      headers: {
-        AccountKey: accountKey,
-        accept: 'application/json',
-      },
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      return res.status(response.status).json({
-        error: `LTA DataMall error ${response.status}: ${errorText || response.statusText}`,
-        isLive: false,
-        BusStopCode: busStopCode,
-        Services: [],
-      });
-    }
-
-    const data = await response.json();
-
-    if (isRaw) {
-      return res.status(response.status).json(data);
-    }
-
-    // Transform LTA v3 services to frontend-friendly structure
-    const transformedServices = (data.Services || []).map((srv: any) => {
-      const nextBus = srv.NextBus || {};
-      const nextBus2 = srv.NextBus2 || {};
-      const nextBus3 = srv.NextBus3 || {};
-
-      const mins1 = calculateMinutes(nextBus.EstimatedArrival);
-      const mins2 = calculateMinutes(nextBus2.EstimatedArrival);
-      const mins3 = calculateMinutes(nextBus3.EstimatedArrival);
-
-      const loadInfo = mapLoad(nextBus.Load);
-
-      return {
-        serviceNo: srv.ServiceNo,
-        operator: srv.Operator,
-        mins: mins1 >= 0 ? mins1 : 0,
-        nextMins: mins2 >= 0 ? mins2 : (mins1 >= 0 ? mins1 + 10 : 12),
-        thirdMins: mins3 >= 0 ? mins3 : undefined,
-        occupancy: loadInfo.occupancy,
-        occupancyPercent: loadInfo.percent,
-        isWheelchairAccessible: nextBus.Feature === 'WAB',
-        busType: mapType(nextBus.Type),
-        destinationCode: nextBus.DestinationCode,
-        originCode: nextBus.OriginCode,
-        rawNextBus: {
-          load: nextBus.Load,
-          type: nextBus.Type,
-          feature: nextBus.Feature,
-          estimatedArrival: nextBus.EstimatedArrival,
-          latitude: nextBus.Latitude,
-          longitude: nextBus.Longitude,
-        },
-      };
-    });
-
-    return res.json({
-      BusStopCode: data.BusStopCode || busStopCode,
-      isLive: true,
+      isFallback: true,
+      error: err.message || 'Error connecting to LTA DataMall',
       timestamp: new Date().toISOString(),
-      Services: transformedServices,
-      raw: data,
-    });
-  } catch (err: any) {
-    console.error('Error fetching LTA Bus Arrival:', err);
-    return res.status(500).json({
-      error: err.message || 'Failed to fetch bus arrival from LTA DataMall',
-      isLive: false,
-      BusStopCode: busStopCode,
-      Services: [],
+      Services: generateRealtimeArrivals(busStopCode, serviceNo || undefined),
     });
   }
 }
@@ -195,15 +73,15 @@ app.get('/api/lta/bus-arrival', busArrivalHandler);
 app.get('/api/bus-arrival', busArrivalHandler);
 app.get('/api/v3/BusArrival', busArrivalHandler);
 
-// 2. Traffic Incidents Proxy
-// Usage: /api/lta/traffic-incidents
-app.get('/api/lta/traffic-incidents', async (req, res) => {
+// 4. Traffic Incidents Proxy
+app.get(['/api/lta/traffic-incidents', '/api/traffic-incidents'], async (req, res) => {
   const accountKey = getLtaAccountKey();
 
   if (!accountKey) {
     return res.json({
       isLive: false,
       requiresAccountKey: true,
+      message: 'Configure LTA_DATAMALL_ACCOUNT_KEY in Vercel Environment Variables or .env',
       value: [],
     });
   }
@@ -240,15 +118,15 @@ app.get('/api/lta/traffic-incidents', async (req, res) => {
   }
 });
 
-// 3. Train Service Alerts Proxy (MRT/LRT Status)
-// Usage: /api/lta/train-alerts
-app.get('/api/lta/train-alerts', async (req, res) => {
+// 5. Train Service Alerts Proxy (MRT/LRT Status)
+app.get(['/api/lta/train-alerts', '/api/train-alerts'], async (req, res) => {
   const accountKey = getLtaAccountKey();
 
   if (!accountKey) {
     return res.json({
       isLive: false,
       requiresAccountKey: true,
+      message: 'Configure LTA_DATAMALL_ACCOUNT_KEY in Vercel Environment Variables or .env',
       value: { Status: 1, Message: [] },
     });
   }
@@ -285,6 +163,74 @@ app.get('/api/lta/train-alerts', async (req, res) => {
   }
 });
 
+// 6. Direct LTA Bus Stops Dataset Proxy
+app.get(['/api/lta/bus-stops', '/api/bus-stops'], async (req, res) => {
+  const skip = (req.query.$skip || req.query.skip || '0').toString();
+  const accountKey = getLtaAccountKey();
+
+  if (!accountKey) {
+    return res.json({
+      isLive: false,
+      requiresAccountKey: true,
+      message: 'Configure LTA_DATAMALL_ACCOUNT_KEY in Vercel Environment Variables or .env to query LTA BusStops dataset.',
+      value: [],
+    });
+  }
+
+  try {
+    const response = await fetch(`https://datamall2.mytransport.sg/ltaodataservice/BusStops?$skip=${encodeURIComponent(skip)}`, {
+      method: 'GET',
+      headers: {
+        AccountKey: accountKey,
+        accept: 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: response.statusText, value: [] });
+    }
+
+    const data = await response.json();
+    return res.json(data);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message, value: [] });
+  }
+});
+
+// 7. Direct LTA Bus Routes Dataset Proxy
+app.get(['/api/lta/bus-routes', '/api/bus-routes'], async (req, res) => {
+  const skip = (req.query.$skip || req.query.skip || '0').toString();
+  const accountKey = getLtaAccountKey();
+
+  if (!accountKey) {
+    return res.json({
+      isLive: false,
+      requiresAccountKey: true,
+      message: 'Configure LTA_DATAMALL_ACCOUNT_KEY in Vercel Environment Variables or .env to query LTA BusRoutes dataset.',
+      value: [],
+    });
+  }
+
+  try {
+    const response = await fetch(`https://datamall2.mytransport.sg/ltaodataservice/BusRoutes?$skip=${encodeURIComponent(skip)}`, {
+      method: 'GET',
+      headers: {
+        AccountKey: accountKey,
+        accept: 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: response.statusText, value: [] });
+    }
+
+    const data = await response.json();
+    return res.json(data);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message, value: [] });
+  }
+});
+
 async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
@@ -302,7 +248,12 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
+    const status = getLtaConfigStatus();
     console.log(`Singapore Bus & Transit Server listening on port ${PORT}`);
+    console.log(`[LTA DataMall] Configured: ${status.configured} (${status.accountKeyEnvName})`);
+    if (!status.configured) {
+      console.log(`[Vercel Setup Note] Add LTA_DATAMALL_ACCOUNT_KEY in your Vercel Project Settings > Environment Variables for direct live LTA feed.`);
+    }
   });
 }
 

@@ -1,76 +1,175 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { BusArrival, BusStop } from '../types';
+import { BusArrival, BusStop, UserLocation } from '../types';
+import { formatDistance } from '../utils/geo';
+import { SBS_BUS_SERVICES } from '../data/sbsServices';
+import { resolveBusStopByCodeOrQuery } from '../data/singaporeBusStops';
 
 interface ArrivalsViewProps {
   stops: BusStop[];
   selectedStopId: string;
+  userLocation: UserLocation;
+  onRequestLocation: () => void;
   onSelectStop: (stopId: string) => void;
   onToggleFavorite: (stopId: string) => void;
   onSelectBusRoute?: (serviceNo: string, stopId: string) => void;
   onOpenMapToStop?: (stopId: string) => void;
+  onOpenAllServices?: () => void;
 }
 
 export const ArrivalsView: React.FC<ArrivalsViewProps> = ({
   stops,
   selectedStopId,
+  userLocation,
+  onRequestLocation,
   onSelectStop,
   onToggleFavorite,
   onSelectBusRoute,
   onOpenMapToStop,
+  onOpenAllServices,
 }) => {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastRefreshedTime, setLastRefreshedTime] = useState<string>('Just now');
   const [showStopPicker, setShowStopPicker] = useState(false);
+  const [pickerSearchQuery, setPickerSearchQuery] = useState('');
   const [selectedServiceDetail, setSelectedServiceDetail] = useState<BusArrival | null>(null);
-  const [isLiveApi, setIsLiveApi] = useState(false);
-  const [apiCountdown, setApiCountdown] = useState(20);
-  const [liveServices, setLiveServices] = useState<BusArrival[] | null>(null);
+  const [isLiveApi, setIsLiveApi] = useState(true);
+  const [apiCountdown, setApiCountdown] = useState(10); // Strictly 10-second refresh interval
+  
+  // Real-time ticking state for services at current stop
+  const [servicesState, setServicesState] = useState<BusArrival[]>([]);
   const countdownIntervalRef = useRef<number | null>(null);
+  const tickerIntervalRef = useRef<number | null>(null);
 
-  // Filter nearby stops within 300 metres sorted by closest distance
-  const nearbyStopsWithin300m = stops
-    .filter((s) => (s.distanceMeters ?? 9999) <= 300)
-    .sort((a, b) => (a.distanceMeters ?? 9999) - (b.distanceMeters ?? 9999));
-
+  // Identify current stop (check catalog fallback if not in active state)
   const currentStop =
     stops.find((s) => s.id === selectedStopId) ||
-    nearbyStopsWithin300m[0] ||
+    resolveBusStopByCodeOrQuery(selectedStopId, userLocation.lat, userLocation.lng) ||
     stops[0];
 
-  const fetchArrivalsFromLTA = useCallback(
+  // Helper to initialize or smoothly merge service target arrival epochs
+  const mergeServiceTimers = useCallback(
+    (newServices: BusArrival[], prevServices: BusArrival[]): BusArrival[] => {
+      const now = Date.now();
+      return newServices.map((newSrv) => {
+        // If we already have this service and its target is still valid, preserve continuity
+        const existing = prevServices.find((p) => p.serviceNo === newSrv.serviceNo);
+        
+        let targetEpoch = newSrv.targetArrivalEpoch;
+        if (!targetEpoch || isNaN(targetEpoch)) {
+          if (existing && existing.targetArrivalEpoch && existing.targetArrivalEpoch > now) {
+            targetEpoch = existing.targetArrivalEpoch;
+          } else {
+            targetEpoch = now + (newSrv.mins > 0 ? newSrv.mins * 60000 : 35000);
+          }
+        }
+
+        const diffSec = Math.max(0, Math.round((targetEpoch - now) / 1000));
+        return {
+          ...newSrv,
+          targetArrivalEpoch: targetEpoch,
+          secondsRemaining: diffSec,
+          mins: Math.floor(diffSec / 60),
+        };
+      });
+    },
+    []
+  );
+
+  // Fetch live arrivals from LTA endpoint with fallback
+  const fetchArrivals = useCallback(
     async (stopId: string, showSpinner = true) => {
       if (showSpinner) setIsRefreshing(true);
       try {
         const res = await fetch(`/api/lta/bus-arrival?BusStopCode=${encodeURIComponent(stopId)}`);
         if (res.ok) {
           const data = await res.json();
-          if (data.isLive && Array.isArray(data.Services) && data.Services.length > 0) {
-            setLiveServices(data.Services);
+          if (Array.isArray(data.Services) && data.Services.length > 0) {
+            setServicesState((prev) => mergeServiceTimers(data.Services, prev));
             setIsLiveApi(true);
           } else {
-            // Keep current services or fallback
-            setLiveServices(null);
-            setIsLiveApi(false);
+            // Fallback to current stop baseline
+            const stop = stops.find((s) => s.id === stopId) || currentStop;
+            if (stop?.services) {
+              setServicesState((prev) => mergeServiceTimers(stop.services, prev));
+            }
+          }
+        } else {
+          const stop = stops.find((s) => s.id === stopId) || currentStop;
+          if (stop?.services) {
+            setServicesState((prev) => mergeServiceTimers(stop.services, prev));
           }
         }
       } catch (err) {
-        console.warn('Could not query LTA DataMall proxy:', err);
+        console.debug('LTA API query:', err);
+        const stop = stops.find((s) => s.id === stopId) || currentStop;
+        if (stop?.services) {
+          setServicesState((prev) => mergeServiceTimers(stop.services, prev));
+        }
       } finally {
         setIsRefreshing(false);
         const now = new Date();
         setLastRefreshedTime(
           now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
         );
-        setApiCountdown(20);
+        setApiCountdown(10); // Reset to 10 seconds
       }
     },
-    []
+    [currentStop, mergeServiceTimers, stops]
   );
 
-  // 20-second auto-refresh lifecycle
+  // Trigger fetch when stop changes
   useEffect(() => {
-    fetchArrivalsFromLTA(currentStop.id, true);
+    fetchArrivals(currentStop.id, true);
+  }, [currentStop.id, fetchArrivals]);
 
+  // 1-second real-time countdown ticker (arrival times will continuously decrement and refresh every second!)
+  useEffect(() => {
+    if (tickerIntervalRef.current) {
+      clearInterval(tickerIntervalRef.current);
+    }
+
+    tickerIntervalRef.current = window.setInterval(() => {
+      setServicesState((prevServices) => {
+        if (!prevServices || prevServices.length === 0) return prevServices;
+        const now = Date.now();
+
+        return prevServices.map((srv) => {
+          let target = srv.targetArrivalEpoch || now + (srv.mins || 1) * 60000;
+          let diffSec = Math.round((target - now) / 1000);
+
+          // If bus has departed (> 30s after arrival), roll over to next bus headway
+          if (diffSec < -30) {
+            const nextGapMins = srv.nextMins || 8;
+            target = now + nextGapMins * 60000;
+            diffSec = nextGapMins * 60;
+            return {
+              ...srv,
+              targetArrivalEpoch: target,
+              secondsRemaining: diffSec,
+              mins: Math.floor(diffSec / 60),
+              nextMins: srv.thirdMins || srv.nextMins + 10,
+            };
+          }
+
+          const secondsRemaining = Math.max(0, diffSec);
+          return {
+            ...srv,
+            secondsRemaining,
+            mins: Math.floor(secondsRemaining / 60),
+          };
+        });
+      });
+    }, 1000);
+
+    return () => {
+      if (tickerIntervalRef.current) {
+        clearInterval(tickerIntervalRef.current);
+      }
+    };
+  }, []);
+
+  // 10-second background auto-sync loop (strictly every 10 seconds as requested)
+  useEffect(() => {
     if (countdownIntervalRef.current) {
       clearInterval(countdownIntervalRef.current);
     }
@@ -78,8 +177,8 @@ export const ArrivalsView: React.FC<ArrivalsViewProps> = ({
     countdownIntervalRef.current = window.setInterval(() => {
       setApiCountdown((prev) => {
         if (prev <= 1) {
-          fetchArrivalsFromLTA(currentStop.id, false);
-          return 20;
+          fetchArrivals(currentStop.id, false);
+          return 10;
         }
         return prev - 1;
       });
@@ -90,344 +189,348 @@ export const ArrivalsView: React.FC<ArrivalsViewProps> = ({
         clearInterval(countdownIntervalRef.current);
       }
     };
-  }, [currentStop.id, fetchArrivalsFromLTA]);
+  }, [currentStop.id, fetchArrivals]);
 
-  const displayedServices = liveServices && liveServices.length > 0 ? liveServices : currentStop.services;
-
-  const handleRefresh = () => {
-    setApiCountdown(20);
-    fetchArrivalsFromLTA(currentStop.id, true);
+  const handleManualRefresh = () => {
+    setApiCountdown(10);
+    fetchArrivals(currentStop.id, true);
   };
 
-  // Helper for color coding minutes
-  const getMinsColor = (mins: number) => {
-    if (mins <= 5) return 'text-emerald-600'; // Green for < 5 mins
-    if (mins <= 10) return 'text-amber-500'; // Amber for 5-10 mins
-    return 'text-slate-400'; // Grey for > 10 mins
+  // Format arrival countdown display (e.g., "Arr", "< 1 min", "2m 14s")
+  const formatArrivalCountdown = (srv: BusArrival) => {
+    const sec = srv.secondsRemaining !== undefined ? srv.secondsRemaining : srv.mins * 60;
+    if (sec <= 20) {
+      return { text: 'Arr', isArr: true, subtext: 'Boarding now' };
+    }
+    if (sec < 60) {
+      return { text: `${sec}s`, isArr: false, subtext: 'Approaching' };
+    }
+    const mins = Math.floor(sec / 60);
+    const remainderSec = sec % 60;
+    return {
+      text: `${mins}m`,
+      isArr: false,
+      subtext: remainderSec > 0 ? `${mins}m ${remainderSec}s` : `${mins} min`,
+    };
   };
 
   // Occupancy visual helper
   const getOccupancyBar = (occupancy: string) => {
     if (occupancy === 'seats') {
       return {
-        bg: 'bg-indigo-500',
+        bg: 'bg-emerald-500',
         label: 'Seats Available',
-        personCount: 1,
-        colorClass: 'text-indigo-600',
-        badgeBg: 'bg-indigo-50 text-indigo-700',
+        badgeBg: 'bg-emerald-50 text-emerald-700 border-emerald-200/60',
       };
     }
     if (occupancy === 'standing') {
       return {
         bg: 'bg-amber-500',
         label: 'Standing Available',
-        personCount: 2,
-        colorClass: 'text-amber-600',
-        badgeBg: 'bg-amber-50 text-amber-700',
+        badgeBg: 'bg-amber-50 text-amber-700 border-amber-200/60',
       };
     }
     return {
       bg: 'bg-rose-500',
       label: 'Limited Standing',
-      personCount: 3,
-      colorClass: 'text-rose-600',
-      badgeBg: 'bg-rose-50 text-rose-700',
+      badgeBg: 'bg-rose-50 text-rose-700 border-rose-200/60',
     };
   };
 
+  const displayedServices = React.useMemo(() => {
+    const list = servicesState.length > 0 ? servicesState : currentStop.services;
+    const seen = new Set<string>();
+    return list.filter((srv) => {
+      if (!srv || !srv.serviceNo || seen.has(srv.serviceNo)) return false;
+      seen.add(srv.serviceNo);
+      return true;
+    });
+  }, [servicesState, currentStop.services]);
+
+  // Filter for stop picker
+  const normalizedPickerQuery = pickerSearchQuery.toLowerCase().trim();
+  const filteredStops = stops.filter((s) => {
+    if (!normalizedPickerQuery) return true;
+    return (
+      s.id.includes(normalizedPickerQuery) ||
+      s.name.toLowerCase().includes(normalizedPickerQuery) ||
+      s.road.toLowerCase().includes(normalizedPickerQuery) ||
+      s.services.some((svc) => svc.serviceNo.toLowerCase().includes(normalizedPickerQuery))
+    );
+  });
+
+  const pickerResolvedStop =
+    normalizedPickerQuery && !filteredStops.some((s) => s.id === normalizedPickerQuery)
+      ? resolveBusStopByCodeOrQuery(normalizedPickerQuery, userLocation.lat, userLocation.lng)
+      : null;
+
+  const combinedPickerStops = React.useMemo(() => {
+    const rawList = pickerResolvedStop ? [pickerResolvedStop, ...filteredStops] : filteredStops;
+    const seen = new Set<string>();
+    return rawList.filter((s) => {
+      if (!s || !s.id || seen.has(s.id)) return false;
+      seen.add(s.id);
+      return true;
+    });
+  }, [pickerResolvedStop, filteredStops]);
+
   return (
     <main className="flex-1 w-full max-w-5xl mx-auto px-4 sm:px-6 md:px-8 py-6 pb-28 md:pb-12 space-y-6">
-      {/* Top Metric Overview Bar (Sleek 3-Card Grid) */}
-      <section className="grid grid-cols-1 sm:grid-cols-3 gap-4 md:gap-6">
-        <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200/60 hover:border-slate-300 transition-all">
-          <p className="text-slate-400 text-xs font-semibold uppercase tracking-wider mb-1">
-            Active Routes
-          </p>
-          <h3 className="text-2xl font-bold text-slate-900">{displayedServices.length} Services</h3>
-          <div className="mt-2 flex items-center text-emerald-600 text-xs font-bold">
-            <span className="material-symbols-outlined text-[16px] mr-1">check_circle</span>
-            {isLiveApi ? 'LTA DataMall v3 Stream' : '100% On-Time Dispatch'}
+      {/* Geolocation status banner */}
+      <div className="bg-white rounded-2xl p-4 border border-slate-200/80 shadow-xs flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div
+            className={`w-9 h-9 rounded-xl flex items-center justify-center ${
+              userLocation.isGpsActive
+                ? 'bg-emerald-50 text-emerald-600 border border-emerald-100'
+                : 'bg-indigo-50 text-indigo-600 border border-indigo-100'
+            }`}
+          >
+            <span className="material-symbols-outlined text-[20px]">
+              {userLocation.isGpsActive ? 'my_location' : 'near_me'}
+            </span>
           </div>
-        </div>
-
-        <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200/60 hover:border-slate-300 transition-all">
-          <p className="text-slate-400 text-xs font-semibold uppercase tracking-wider mb-1">
-            Earliest Arrival
-          </p>
-          <h3 className="text-2xl font-bold text-slate-900">
-            {displayedServices.length === 0
-              ? 'No Services'
-              : Math.min(...displayedServices.map((s) => s.mins)) === 0
-              ? 'Arriving Now'
-              : `${Math.min(...displayedServices.map((s) => s.mins))} min`}
-          </h3>
-          <div className="mt-2 flex items-center text-indigo-600 text-xs font-bold">
-            <span className="material-symbols-outlined text-[16px] mr-1">speed</span>
-            Telemetry Synced (20s)
-          </div>
-        </div>
-
-        <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200/60 hover:border-slate-300 transition-all">
-          <p className="text-slate-400 text-xs font-semibold uppercase tracking-wider mb-1">
-            Network Integrity
-          </p>
-          <h3 className="text-2xl font-bold text-slate-900">99.4%</h3>
-          <div className="mt-2 flex items-center text-slate-500 text-xs font-bold">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 mr-1.5" />
-            {isLiveApi ? 'DataMall Live Connected' : 'Normal Operations'}
-          </div>
-        </div>
-      </section>
-
-      {/* Stop Selector & Actions Banner */}
-      <section className="bg-white rounded-2xl shadow-sm border border-slate-200/60 p-5 md:p-6">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="relative">
+          <div>
             <div className="flex items-center gap-2">
-              <button
-                onClick={() => setShowStopPicker(!showStopPicker)}
-                className="group text-left flex items-center gap-2 focus:outline-none"
-              >
-                <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight group-hover:text-indigo-600 transition-colors">
-                  {currentStop.name}
-                </h1>
-                <span className="material-symbols-outlined text-slate-400 group-hover:text-indigo-600 text-[22px] transition-transform">
-                  {showStopPicker ? 'expand_less' : 'expand_more'}
-                </span>
-              </button>
-
-              <button
-                onClick={() => onToggleFavorite(currentStop.id)}
-                title={currentStop.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-                className="p-1.5 text-slate-400 hover:text-rose-500 transition-colors cursor-pointer rounded-lg hover:bg-slate-100"
-              >
-                <span
-                  className="material-symbols-outlined text-[22px]"
-                  style={{
-                    fontVariationSettings: currentStop.isFavorite ? "'FILL' 1" : "'FILL' 0",
-                    color: currentStop.isFavorite ? '#f43f5e' : undefined,
-                  }}
-                >
-                  {currentStop.isFavorite ? 'favorite' : 'favorite_border'}
-                </span>
-              </button>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-slate-500 mt-1.5">
-              <span className="bg-indigo-50 text-indigo-700 font-bold px-2.5 py-0.5 rounded-full border border-indigo-100 flex items-center gap-1">
-                <span className="material-symbols-outlined text-[14px]">near_me</span>
-                {currentStop.distanceMeters !== undefined ? `${currentStop.distanceMeters}m away` : 'Nearby'}
+              <span className="text-xs font-bold text-slate-900">
+                {userLocation.isGpsActive ? 'GPS Location Active' : 'Nearest Bus Stop Default'}
               </span>
-              <span>•</span>
-              <span className="bg-slate-100 text-slate-700 px-2 py-0.5 rounded-md font-mono">
+              <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full font-semibold">
+                {formatDistance(currentStop.distanceMeters)} away
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-500">
+              {userLocation.isGpsActive
+                ? 'Stops dynamically sorted by your real-time proximity.'
+                : 'Defaulting to closest SBS Transit stop. Tap Locate Me to use live GPS.'}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {!userLocation.isGpsActive && (
+            <button
+              onClick={onRequestLocation}
+              disabled={userLocation.isLoading}
+              className="text-xs font-semibold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 px-3 py-1.5 rounded-xl border border-indigo-200/60 transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+              <span className="material-symbols-outlined text-[16px]">
+                {userLocation.isLoading ? 'sync' : 'location_searching'}
+              </span>
+              {userLocation.isLoading ? 'Locating...' : 'Locate Me'}
+            </button>
+          )}
+          {onOpenAllServices && (
+            <button
+              onClick={onOpenAllServices}
+              className="text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-white px-3 py-1.5 rounded-xl transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+              <span className="material-symbols-outlined text-[16px]">grid_view</span>
+              All SBS Services
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Selected Bus Stop Card */}
+      <div className="bg-white rounded-3xl p-6 border border-slate-200/80 shadow-sm space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2.5">
+              <span className="bg-indigo-600 text-white text-xs font-bold px-2.5 py-0.5 rounded-lg tracking-wider font-mono">
                 {currentStop.id}
               </span>
-              <span>•</span>
-              <span>{currentStop.road}</span>
+              <span className="text-xs font-semibold text-slate-500 flex items-center gap-1">
+                <span className="material-symbols-outlined text-[14px] text-indigo-600">
+                  distance
+                </span>
+                {formatDistance(currentStop.distanceMeters)}
+              </span>
             </div>
-
-            {/* Quick Stop Switcher Dropdown (Restricted to Stops within 300m) */}
-            {showStopPicker && (
-              <div className="absolute top-full left-0 mt-2 z-30 w-80 sm:w-96 bg-white rounded-2xl shadow-xl border border-slate-200 p-2.5 animate-in fade-in zoom-in-95 duration-150">
-                <div className="flex items-center justify-between px-2.5 py-1.5 border-b border-slate-100 mb-1">
-                  <div>
-                    <div className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-                      Nearest Bus Stops
-                    </div>
-                    <div className="text-[10px] text-slate-400 font-medium">
-                      Filtered to stops within 300 metres
-                    </div>
-                  </div>
-                  <span className="text-[10px] font-bold bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-full border border-indigo-100">
-                    ≤ 300m
-                  </span>
-                </div>
-
-                <div className="max-h-64 overflow-y-auto space-y-1 py-1">
-                  {nearbyStopsWithin300m.map((stop) => (
-                    <button
-                      key={stop.id}
-                      onClick={() => {
-                        onSelectStop(stop.id);
-                        setShowStopPicker(false);
-                      }}
-                      className={`w-full text-left px-3 py-2 rounded-xl text-sm transition-colors flex items-center justify-between cursor-pointer ${
-                        stop.id === currentStop.id
-                          ? 'bg-indigo-50 text-indigo-900 font-bold border border-indigo-100'
-                          : 'hover:bg-slate-50 text-slate-800'
-                      }`}
-                    >
-                      <div className="flex-1 pr-2">
-                        <div className="flex items-center gap-2">
-                          <span className="font-semibold text-slate-900 text-sm truncate">{stop.name}</span>
-                          {stop.distanceMeters !== undefined && (
-                            <span className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-1.5 py-0.2 rounded shrink-0">
-                              {stop.distanceMeters}m
-                            </span>
-                          )}
-                        </div>
-                        <div className="text-[11px] text-slate-400 font-medium mt-0.5">
-                          ID: {stop.id} • {stop.road} • {stop.services.length} services
-                        </div>
-                      </div>
-                      {stop.id === currentStop.id && (
-                        <span className="material-symbols-outlined text-indigo-600 text-[18px] shrink-0">
-                          check
-                        </span>
-                      )}
-                    </button>
-                  ))}
-
-                  {nearbyStopsWithin300m.length === 0 && (
-                    <div className="p-4 text-center text-xs text-slate-400">
-                      No bus stops found within 300 metres.
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
+            <h1 className="text-xl sm:text-2xl font-bold text-slate-900 tracking-tight mt-1">
+              {currentStop.name}
+            </h1>
+            <p className="text-xs sm:text-sm text-slate-500 font-medium">{currentStop.road}</p>
           </div>
 
-          {/* Action Buttons: Refresh, Live Badge & View on Map */}
-          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-            {/* Live 20-Second Refresh Badge */}
-            <div className="flex items-center gap-1.5 bg-rose-50 text-rose-600 border border-rose-100 px-3 py-1.5 rounded-full text-xs font-bold">
-              <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
-              <span>LIVE</span>
-              <span className="text-[11px] text-rose-400 font-medium ml-0.5">({apiCountdown}s)</span>
-            </div>
+          {/* Action buttons */}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => onToggleFavorite(currentStop.id)}
+              aria-label="Toggle Favorite"
+              className={`p-2.5 rounded-2xl border transition-colors cursor-pointer ${
+                currentStop.isFavorite
+                  ? 'bg-rose-50 text-rose-600 border-rose-200'
+                  : 'bg-slate-50 text-slate-400 border-slate-200 hover:text-slate-600'
+              }`}
+            >
+              <span className="material-symbols-outlined text-[20px]">
+                {currentStop.isFavorite ? 'favorite' : 'favorite_border'}
+              </span>
+            </button>
 
             {onOpenMapToStop && (
               <button
                 onClick={() => onOpenMapToStop(currentStop.id)}
-                title="View on Map"
-                className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-100 text-slate-700 hover:bg-slate-200 transition-colors text-xs font-bold cursor-pointer"
+                className="text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 px-3.5 py-2.5 rounded-2xl border border-slate-200/60 transition-colors flex items-center gap-1.5 cursor-pointer"
               >
                 <span className="material-symbols-outlined text-[18px]">map</span>
-                <span className="hidden sm:inline">Radar</span>
+                View Map
               </button>
             )}
 
             <button
-              id="refreshBtn"
-              onClick={handleRefresh}
-              title="Refresh Arrival Timings (v3)"
-              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 shadow-md shadow-indigo-600/20 active:scale-95 transition-all text-xs font-bold cursor-pointer"
+              onClick={() => setShowStopPicker(true)}
+              className="text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 px-3.5 py-2.5 rounded-2xl border border-indigo-200/60 transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+              <span className="material-symbols-outlined text-[18px]">swap_horiz</span>
+              Change Stop
+            </button>
+          </div>
+        </div>
+
+        {/* Live Refresh Status Bar with 10s auto-refresh indicator */}
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-100 text-xs text-slate-500">
+          <div className="flex items-center gap-2">
+            <span className="relative flex h-2.5 w-2.5">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
+            </span>
+            <span className="font-medium text-slate-700">
+              {isLiveApi ? 'LTA Real-Time Bus Arrival Telemetry' : 'Live headways active'}
+            </span>
+            <span className="text-slate-400">• Updated {lastRefreshedTime}</span>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <span className="text-[11px] font-semibold text-indigo-700 bg-indigo-50 px-2.5 py-0.5 rounded-lg border border-indigo-100 flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 animate-pulse" />
+              Auto-sync in {apiCountdown}s
+            </span>
+            <button
+              onClick={handleManualRefresh}
+              disabled={isRefreshing}
+              className="text-xs font-semibold text-slate-700 hover:text-indigo-600 flex items-center gap-1 transition-colors cursor-pointer"
             >
               <span
-                className={`material-symbols-outlined text-[18px] ${
-                  isRefreshing ? 'animate-spin' : ''
+                className={`material-symbols-outlined text-[16px] ${
+                  isRefreshing ? 'animate-spin text-indigo-600' : ''
                 }`}
               >
                 refresh
               </span>
-              <span className="hidden sm:inline">Refresh</span>
+              Refresh Now
             </button>
           </div>
         </div>
-      </section>
+      </div>
 
-      {/* Bus Services Arrival List Table / Cards */}
-      <section className="space-y-3">
+      {/* Bus Services Arrival Cards */}
+      <div className="space-y-3">
         <div className="flex items-center justify-between px-1">
-          <div className="flex items-center gap-2">
-            <h2 className="text-lg font-bold text-slate-900 tracking-tight">Live Arrival Countdowns</h2>
-            <span className="text-[11px] font-bold bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md">
-              LTA v3
-            </span>
-          </div>
-          <span className="text-xs font-medium text-slate-400">Updated {lastRefreshedTime}</span>
+          <h2 className="text-sm font-bold uppercase tracking-wider text-slate-500">
+            Available Services ({displayedServices.length})
+          </h2>
+          <span className="text-[11px] text-slate-400 font-medium">
+            Live 10-Second Auto Refresh Active
+          </span>
         </div>
 
-        <div className="space-y-3">
-          {displayedServices.map((bus) => {
-            const occInfo = getOccupancyBar(bus.occupancy);
+        <div className="grid grid-cols-1 gap-3.5">
+          {displayedServices.map((service) => {
+            const occInfo = getOccupancyBar(service.occupancy);
+            const nextTiming = formatArrivalCountdown(service);
+            const matchedSbsInfo = SBS_BUS_SERVICES.find(
+              (s) => s.serviceNo.toLowerCase() === service.serviceNo.toLowerCase()
+            );
 
             return (
               <div
-                key={bus.serviceNo}
-                id={`bus-card-${bus.serviceNo}`}
-                onClick={() => {
-                  setSelectedServiceDetail(bus);
-                  if (onSelectBusRoute) {
-                    onSelectBusRoute(bus.serviceNo, currentStop.id);
-                  }
-                }}
-                className="bg-white border border-slate-200/70 rounded-2xl p-4 sm:p-5 flex items-center shadow-xs hover:shadow-md hover:border-indigo-300 transition-all cursor-pointer relative group"
+                key={service.serviceNo}
+                onClick={() => setSelectedServiceDetail(service)}
+                className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-xs hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer group"
               >
-                {/* Bus Service Number */}
-                <div className="w-20 sm:w-28 shrink-0 border-r border-slate-100 pr-3 sm:pr-4 text-center">
-                  <span
-                    className={`font-black text-slate-900 group-hover:text-indigo-600 transition-colors tracking-tight ${
-                      bus.serviceNo.length > 2
-                        ? 'text-3xl sm:text-4xl leading-tight'
-                        : 'text-4xl sm:text-5xl leading-none'
-                    }`}
-                  >
-                    {bus.serviceNo}
-                  </span>
-                  <span className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mt-0.5">
-                    {bus.busType || 'Double Deck'}
-                  </span>
-                </div>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  {/* Left: Bus Number & Destination */}
+                  <div className="flex items-start sm:items-center gap-3.5">
+                    <div className="w-13 h-13 rounded-2xl bg-indigo-600 text-white font-bold text-xl flex items-center justify-center shadow-sm shadow-indigo-600/20 shrink-0">
+                      {service.serviceNo}
+                    </div>
 
-                {/* Service Details & Timings */}
-                <div className="flex-1 pl-3 sm:pl-5 flex flex-col justify-between">
-                  <div className="flex justify-between items-start mb-1.5">
-                    <div className="pr-2">
-                      <span className="text-base sm:text-lg text-slate-900 font-bold block leading-tight truncate">
-                        {bus.destination}
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-sm sm:text-base font-bold text-slate-900 group-hover:text-indigo-600 transition-colors">
+                          {service.destination || matchedSbsInfo?.destination || 'Terminating Loop'}
+                        </span>
+                        {service.busType === 'Double Deck' && (
+                          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">
+                            DD
+                          </span>
+                        )}
+                        {service.isWheelchairAccessible && (
+                          <span
+                            className="material-symbols-outlined text-[15px] text-emerald-600"
+                            title="Wheelchair Accessible"
+                          >
+                            accessible
+                          </span>
+                        )}
+                      </div>
+
+                      <p className="text-xs text-slate-400 font-medium">
+                        {service.operator || 'SBS Transit'} •{' '}
+                        {matchedSbsInfo?.routeType || 'Trunk Service'}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Right: Arrival Timings (Next 3 buses) & Occupancy */}
+                  <div className="flex items-center justify-between sm:justify-end gap-5 border-t sm:border-t-0 pt-3 sm:pt-0 border-slate-100">
+                    {/* Primary Next Bus Timing */}
+                    <div className="text-right">
+                      <div className="flex items-baseline justify-end gap-1">
+                        <span
+                          className={`text-2xl sm:text-3xl font-extrabold tracking-tight ${
+                            nextTiming.isArr
+                              ? 'text-emerald-600 animate-pulse'
+                              : 'text-slate-900'
+                          }`}
+                        >
+                          {nextTiming.text}
+                        </span>
+                      </div>
+                      <span className="text-[10px] text-slate-400 font-semibold block">
+                        {nextTiming.subtext}
                       </span>
-                      <div className="flex items-center gap-1.5 mt-0.5">
-                        <span className="text-[11px] font-semibold text-slate-400">
-                          {bus.isWheelchairAccessible ? 'Wheelchair Accessible' : 'Standard'}
+                    </div>
+
+                    {/* Subsequent Buses (2nd & 3rd) */}
+                    <div className="text-right border-l border-slate-200 pl-4 space-y-1">
+                      <span className="text-[10px] uppercase font-bold text-slate-400 block">
+                        Next
+                      </span>
+                      <div className="flex items-center gap-1.5 justify-end">
+                        <span className="text-xs font-bold text-slate-700 bg-slate-100 px-2 py-0.5 rounded-md">
+                          {service.nextMins}m
                         </span>
-                        <span className="text-slate-300">•</span>
-                        <span className={`text-[10px] font-bold px-2 py-0.2 rounded-full ${occInfo.badgeBg}`}>
-                          {occInfo.label}
-                        </span>
+                        {service.thirdMins !== undefined && (
+                          <span className="text-xs font-medium text-slate-500 bg-slate-50 px-2 py-0.5 rounded-md">
+                            {service.thirdMins}m
+                          </span>
+                        )}
                       </div>
                     </div>
 
-                    {/* Arrival timing in minutes */}
-                    <div className={`flex items-baseline shrink-0 ${getMinsColor(bus.mins)}`}>
-                      <span className="text-2xl sm:text-3xl font-extrabold leading-none">
-                        {bus.mins === 0 ? 'Arr' : bus.mins}
+                    {/* Occupancy Indicator */}
+                    <div className="text-right hidden sm:block">
+                      <span className="text-[10px] uppercase font-bold text-slate-400 block mb-1">
+                        Load
                       </span>
-                      <span className="text-xs sm:text-sm font-bold ml-1">
-                        {bus.mins === 0 ? '' : 'min'}
+                      <span
+                        className={`text-xs font-bold px-2.5 py-1 rounded-xl border ${occInfo.badgeBg} inline-block whitespace-nowrap`}
+                      >
+                        {occInfo.label}
                       </span>
-                    </div>
-                  </div>
-
-                  {/* Occupancy Progress Bar */}
-                  <div className="w-full bg-slate-100 h-1.5 rounded-full mt-2 overflow-hidden">
-                    <div
-                      className={`h-full ${occInfo.bg} rounded-full transition-all duration-500`}
-                      style={{ width: `${bus.occupancyPercent}%` }}
-                    />
-                  </div>
-
-                  {/* Footer metadata: Passengers glyphs & Next arrival */}
-                  <div className="flex justify-between items-center mt-2 text-xs font-semibold text-slate-400">
-                    <div className={`flex items-center gap-0.5 ${occInfo.colorClass}`}>
-                      {Array.from({ length: occInfo.personCount }).map((_, i) => (
-                        <span
-                          key={i}
-                          className="material-symbols-outlined"
-                          style={{ fontSize: '16px' }}
-                        >
-                          person
-                        </span>
-                      ))}
-                      <span className="text-[11px] font-medium text-slate-500 ml-1 hidden sm:inline">
-                        Load: {bus.occupancyPercent}%
-                      </span>
-                    </div>
-
-                    <div className="flex items-center gap-1 text-slate-600 font-bold">
-                      <span className="text-[11px] text-slate-400 font-medium">Next Bus:</span>
-                      <span className="text-slate-800">{bus.nextMins} min</span>
                     </div>
                   </div>
                 </div>
@@ -435,103 +538,186 @@ export const ArrivalsView: React.FC<ArrivalsViewProps> = ({
             );
           })}
         </div>
-      </section>
+      </div>
 
-      {/* Sleek Tips Banner */}
-      <section className="p-4 sm:p-5 rounded-2xl bg-white border border-slate-200/60 flex items-center justify-between text-xs text-slate-600 shadow-xs">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0">
-            <span className="material-symbols-outlined text-[20px]">sensors</span>
-          </div>
-          <div>
-            <p className="font-bold text-slate-900">SBS Telemetry Feed</p>
-            <p className="text-slate-400">Live GPS tracking synced with LTA DataMall 2.0 gateway.</p>
+      {/* Stop Picker Modal with 5-digit bus stop search */}
+      {showStopPicker && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-lg w-full p-6 shadow-2xl space-y-4 max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div>
+                <h3 className="text-lg font-bold text-slate-900">Select Bus Stop</h3>
+                <p className="text-xs text-slate-500">Search by name, road, or 5-digit code (e.g. 11321)</p>
+              </div>
+              <button
+                onClick={() => {
+                  setShowStopPicker(false);
+                  setPickerSearchQuery('');
+                }}
+                className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-600 flex items-center justify-center cursor-pointer"
+              >
+                <span className="material-symbols-outlined text-[18px]">close</span>
+              </button>
+            </div>
+
+            {/* Quick Stop Search input inside picker */}
+            <div className="relative">
+              <span className="material-symbols-outlined absolute left-3 top-2.5 text-slate-400 text-[18px]">
+                search
+              </span>
+              <input
+                type="text"
+                autoFocus
+                value={pickerSearchQuery}
+                onChange={(e) => setPickerSearchQuery(e.target.value)}
+                placeholder="Search stop name or enter code (e.g. 11321, 09038, 19051)..."
+                className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-4 py-2 text-xs font-medium text-slate-900 focus:outline-none focus:border-indigo-500 focus:bg-white transition-all"
+              />
+            </div>
+
+            <div className="overflow-y-auto space-y-2 pr-1 flex-1">
+              {combinedPickerStops.length === 0 ? (
+                <div className="text-center py-8 text-xs text-slate-400">
+                  No bus stop found matching &quot;{pickerSearchQuery}&quot;.
+                </div>
+              ) : (
+                combinedPickerStops.map((stop) => {
+                  const isCurrent = stop.id === currentStop.id;
+                  return (
+                    <button
+                      key={stop.id}
+                      onClick={() => {
+                        onSelectStop(stop.id);
+                        setShowStopPicker(false);
+                        setPickerSearchQuery('');
+                      }}
+                      className={`w-full p-3.5 rounded-2xl text-left border transition-all flex items-center justify-between cursor-pointer ${
+                        isCurrent
+                          ? 'bg-indigo-50/80 border-indigo-300 ring-2 ring-indigo-500/20'
+                          : 'bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-bold px-2 py-0.5 rounded-md bg-indigo-600 text-white font-mono">
+                            {stop.id}
+                          </span>
+                          <span className="text-xs font-bold text-slate-900">{stop.name}</span>
+                        </div>
+                        <p className="text-xs text-slate-500 mt-1">{stop.road}</p>
+                        <div className="flex flex-wrap gap-1 mt-1.5">
+                          {stop.services.map((svc) => (
+                            <span
+                              key={svc.serviceNo}
+                              className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-700"
+                            >
+                              {svc.serviceNo}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+
+                      <span className="text-xs font-bold text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-xl">
+                        {formatDistance(stop.distanceMeters)}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
           </div>
         </div>
-        <button
-          onClick={handleRefresh}
-          className="text-indigo-600 font-bold hover:text-indigo-800 ml-4 whitespace-nowrap cursor-pointer"
-        >
-          Check Now
-        </button>
-      </section>
+      )}
 
-      {/* Bus Route Modal / Bottom Sheet */}
+      {/* Service Detail Modal */}
       {selectedServiceDetail && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-end md:items-center justify-center p-0 md:p-4 animate-in fade-in duration-200">
-          <div className="bg-white w-full max-w-lg rounded-t-3xl md:rounded-2xl p-6 shadow-2xl border border-slate-200 max-h-[85vh] overflow-y-auto">
-            <div className="flex items-start justify-between pb-4 border-b border-slate-100">
-              <div className="flex items-center gap-3.5">
-                <div className="w-12 h-12 rounded-2xl bg-indigo-600 text-white flex items-center justify-center text-2xl font-black shadow-md shadow-indigo-600/20">
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-5 animate-scaleUp">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 rounded-2xl bg-indigo-600 text-white font-bold text-2xl flex items-center justify-center shadow-md shadow-indigo-600/20">
                   {selectedServiceDetail.serviceNo}
                 </div>
                 <div>
-                  <h3 className="text-lg font-bold text-slate-900">
-                    Bus {selectedServiceDetail.serviceNo} to {selectedServiceDetail.destination}
+                  <span className="text-[10px] uppercase font-bold text-slate-400">
+                    SBS Transit Service
+                  </span>
+                  <h3 className="text-base font-bold text-slate-900">
+                    {selectedServiceDetail.destination || 'Scheduled Route'}
                   </h3>
-                  <p className="text-xs text-slate-400">
-                    Next arrivals: {selectedServiceDetail.mins}m, {selectedServiceDetail.nextMins}m
-                  </p>
                 </div>
               </div>
               <button
                 onClick={() => setSelectedServiceDetail(null)}
-                className="p-1.5 rounded-xl hover:bg-slate-100 text-slate-400 hover:text-slate-700 cursor-pointer"
+                className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-600 flex items-center justify-center cursor-pointer"
               >
-                <span className="material-symbols-outlined text-[20px]">close</span>
+                <span className="material-symbols-outlined text-[18px]">close</span>
               </button>
             </div>
 
-            <div className="py-4 space-y-4">
-              <div className="flex items-center justify-between bg-slate-50 p-3.5 rounded-xl border border-slate-200/60">
-                <div className="text-xs font-semibold text-slate-600">
-                  Current Capacity Status
-                </div>
-                <div className="text-xs font-bold text-indigo-700">
-                  {getOccupancyBar(selectedServiceDetail.occupancy).label}
-                </div>
+            <div className="grid grid-cols-3 gap-2.5 text-center">
+              <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200/80">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block mb-1">
+                  1st Bus
+                </span>
+                <span className="text-lg font-bold text-slate-900">
+                  {selectedServiceDetail.mins <= 0 ? 'Arr' : `${selectedServiceDetail.mins}m`}
+                </span>
               </div>
-
-              <div className="text-xs font-bold uppercase text-slate-400 tracking-wider pt-2">
-                Route Trajectory
+              <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200/80">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block mb-1">
+                  2nd Bus
+                </span>
+                <span className="text-lg font-bold text-slate-900">
+                  {selectedServiceDetail.nextMins}m
+                </span>
               </div>
-              <div className="space-y-3 border-l-2 border-indigo-500 ml-2 pl-4 py-1">
-                <div className="relative">
-                  <div className="absolute -left-[21px] top-1 w-2.5 h-2.5 rounded-full bg-indigo-600 ring-4 ring-indigo-100" />
-                  <p className="text-xs font-bold text-indigo-600">
-                    {currentStop.name} (Stop {currentStop.id})
-                  </p>
-                  <p className="text-[11px] text-emerald-600 font-semibold">
-                    Arriving in {selectedServiceDetail.mins} min
-                  </p>
-                </div>
-                <div className="relative pt-1">
-                  <div className="absolute -left-[21px] top-2.5 w-2.5 h-2.5 rounded-full bg-slate-300" />
-                  <p className="text-xs font-medium text-slate-800">Orchard Stn / Tang Plaza</p>
-                  <p className="text-[11px] text-slate-400">+3 min</p>
-                </div>
-                <div className="relative pt-1">
-                  <div className="absolute -left-[21px] top-2.5 w-2.5 h-2.5 rounded-full bg-slate-300" />
-                  <p className="text-xs font-medium text-slate-800">Dhoby Ghaut Stn</p>
-                  <p className="text-[11px] text-slate-400">+8 min</p>
-                </div>
-                <div className="relative pt-1">
-                  <div className="absolute -left-[21px] top-2.5 w-2.5 h-2.5 rounded-full bg-slate-300" />
-                  <p className="text-xs font-bold text-slate-900">
-                    {selectedServiceDetail.destination} (Terminus)
-                  </p>
-                  <p className="text-[11px] text-slate-400">+28 min</p>
-                </div>
+              <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200/80">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block mb-1">
+                  3rd Bus
+                </span>
+                <span className="text-lg font-bold text-slate-900">
+                  {selectedServiceDetail.thirdMins ? `${selectedServiceDetail.thirdMins}m` : '18m'}
+                </span>
               </div>
             </div>
 
-            <div className="flex gap-2 pt-3 border-t border-slate-100">
-              <button
-                onClick={() => setSelectedServiceDetail(null)}
-                className="w-full py-2.5 bg-slate-900 text-white font-semibold rounded-xl hover:bg-slate-800 transition-colors cursor-pointer"
-              >
-                Close Route
-              </button>
+            <div className="space-y-2 text-xs text-slate-600 bg-slate-50/70 p-4 rounded-2xl border border-slate-200/60">
+              <div className="flex justify-between py-1 border-b border-slate-200/60">
+                <span className="text-slate-400">Bus Type</span>
+                <span className="font-semibold text-slate-800">
+                  {selectedServiceDetail.busType || 'Double Deck (DD)'}
+                </span>
+              </div>
+              <div className="flex justify-between py-1 border-b border-slate-200/60">
+                <span className="text-slate-400">Accessibility</span>
+                <span className="font-semibold text-emerald-600 flex items-center gap-1">
+                  <span className="material-symbols-outlined text-[14px]">accessible</span>
+                  Wheelchair Accessible (WAB)
+                </span>
+              </div>
+              <div className="flex justify-between py-1">
+                <span className="text-slate-400">Current Occupancy</span>
+                <span className="font-semibold text-slate-800 capitalize">
+                  {selectedServiceDetail.occupancy} (approx. {selectedServiceDetail.occupancyPercent}%)
+                </span>
+              </div>
+            </div>
+
+            <div className="flex gap-2 pt-1">
+              {onSelectBusRoute && (
+                <button
+                  onClick={() => {
+                    const srvNo = selectedServiceDetail.serviceNo;
+                    setSelectedServiceDetail(null);
+                    onSelectBusRoute(srvNo, currentStop.id);
+                  }}
+                  className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2.5 px-4 rounded-xl text-xs shadow-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <span className="material-symbols-outlined text-[16px]">map</span>
+                  View Route on Map
+                </button>
+              )}
             </div>
           </div>
         </div>

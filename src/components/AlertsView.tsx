@@ -89,10 +89,18 @@ export const AlertsView: React.FC<AlertsViewProps> = () => {
     setExpandedAlertIds((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
-  const filteredAlerts = alerts.filter((alert) => {
-    if (selectedCategory === 'all') return true;
-    return alert.category === selectedCategory;
-  });
+  const filteredAlerts = React.useMemo(() => {
+    const list = alerts.filter((alert) => {
+      if (selectedCategory === 'all') return true;
+      return alert.category === selectedCategory;
+    });
+    const seen = new Set<string>();
+    return list.filter((a) => {
+      if (!a || !a.id || seen.has(a.id)) return false;
+      seen.add(a.id);
+      return true;
+    });
+  }, [alerts, selectedCategory]);
 
   const busCount = alerts.filter((a) => a.category === 'bus').length;
   const mrtCount = alerts.filter((a) => a.category === 'mrt' && a.type !== 'NORMAL').length;

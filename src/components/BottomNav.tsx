@@ -19,6 +19,7 @@ export const BottomNav: React.FC<BottomNavProps> = ({
     badge?: number;
   }[] = [
     { key: 'arrivals', label: 'Arrivals', icon: 'directions_bus' },
+    { key: 'services', label: 'SBS Fleet', icon: 'grid_view' },
     { key: 'map', label: 'Map', icon: 'map' },
     { key: 'plan', label: 'Plan', icon: 'route' },
     { key: 'alerts', label: 'Alerts', icon: 'notifications', badge: unreadAlertsCount },

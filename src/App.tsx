@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { AlertsView } from './components/AlertsView';
 import { ArrivalsView } from './components/ArrivalsView';
 import { BottomNav } from './components/BottomNav';
@@ -7,26 +7,29 @@ import { LiveMapView } from './components/LiveMapView';
 import { PlanView } from './components/PlanView';
 import { SearchModal } from './components/SearchModal';
 import { SideMenuDrawer } from './components/SideMenuDrawer';
+import { SBSServicesView } from './components/SBSServicesView';
+import { BackendStatusModal } from './components/BackendStatusModal';
 import { INITIAL_BUS_STOPS } from './data/transitData';
-import { BusStop, TabType } from './types';
-
-// Helper to determine the nearest bus stop by distance
-const getNearestStopId = (busStops: BusStop[]): string => {
-  if (!busStops.length) return '';
-  const sorted = [...busStops].sort(
-    (a, b) => (a.distanceMeters ?? 9999) - (b.distanceMeters ?? 9999)
-  );
-  return sorted[0].id;
-};
+import { TabType } from './types';
+import { useUserLocation } from './hooks/useUserLocation';
 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<TabType>('arrivals');
-  const [stops, setStops] = useState<BusStop[]>(INITIAL_BUS_STOPS);
-  const [selectedStopId, setSelectedStopId] = useState<string>(() =>
-    getNearestStopId(INITIAL_BUS_STOPS)
-  );
+  const [selectedStopId, setSelectedStopId] = useState<string>(INITIAL_BUS_STOPS[0].id);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [isBackendStatusOpen, setIsBackendStatusOpen] = useState(false);
+
+  // Auto-select nearest stop callback
+  const handleAutoSelectNearest = useCallback((nearestStopId: string) => {
+    setSelectedStopId(nearestStopId);
+  }, []);
+
+  // GPS User Location & Proximity Engine
+  const { stops, setStops, location, requestLocation } = useUserLocation(
+    INITIAL_BUS_STOPS,
+    handleAutoSelectNearest
+  );
 
   // Toggle favorite stop status
   const handleToggleFavorite = (stopId: string) => {
@@ -48,9 +51,9 @@ export default function App() {
   };
 
   const handleOpenArrivalsForBus = (serviceNo: string) => {
-    // Find stop that has this service
+    // Find stop that has this service, prioritizing closest stop
     const matchingStop = stops.find((s) =>
-      s.services.some((svc) => svc.serviceNo === serviceNo)
+      s.services.some((svc) => svc.serviceNo.toLowerCase() === serviceNo.toLowerCase())
     );
     if (matchingStop) {
       setSelectedStopId(matchingStop.id);
@@ -66,6 +69,7 @@ export default function App() {
         onOpenMenu={() => setIsMenuOpen(true)}
         onOpenSearch={() => setIsSearchOpen(true)}
         onSelectTab={setCurrentTab}
+        onOpenBackendStatus={() => setIsBackendStatusOpen(true)}
       />
 
       {/* Main Content Area */}
@@ -74,12 +78,22 @@ export default function App() {
           <ArrivalsView
             stops={stops}
             selectedStopId={selectedStopId}
+            userLocation={location}
+            onRequestLocation={requestLocation}
             onSelectStop={setSelectedStopId}
             onToggleFavorite={handleToggleFavorite}
             onSelectBusRoute={(serviceNo) => {
-              console.log(`Selected bus route: ${serviceNo}`);
+              handleOpenArrivalsForBus(serviceNo);
             }}
             onOpenMapToStop={handleOpenMapToStop}
+            onOpenAllServices={() => setCurrentTab('services')}
+          />
+        )}
+
+        {currentTab === 'services' && (
+          <SBSServicesView
+            onSelectService={handleOpenArrivalsForBus}
+            onOpenArrivalsForStop={handleSelectStop}
           />
         )}
 
@@ -127,6 +141,13 @@ export default function App() {
         onClose={() => setIsMenuOpen(false)}
         currentTab={currentTab}
         onSelectTab={setCurrentTab}
+        onOpenBackendStatus={() => setIsBackendStatusOpen(true)}
+      />
+
+      {/* Backend & Vercel Diagnostics Modal */}
+      <BackendStatusModal
+        isOpen={isBackendStatusOpen}
+        onClose={() => setIsBackendStatusOpen(false)}
       />
     </div>
   );

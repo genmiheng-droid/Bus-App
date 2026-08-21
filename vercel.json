@@ -1,13 +1,37 @@
 {
-  "version": 2,
+  "framework": "vite",
   "rewrites": [
     {
-      "source": "/api/(.*)",
-      "destination": "/api/$1"
+      "source": "/api/lta/bus-arrival",
+      "destination": "/api/bus-arrival"
     },
     {
-      "source": "/(.*)",
-      "destination": "/index.html"
+      "source": "/api/v3/BusArrival",
+      "destination": "/api/bus-arrival"
+    },
+    {
+      "source": "/api/lta/traffic-incidents",
+      "destination": "/api/traffic-incidents"
+    },
+    {
+      "source": "/api/lta/train-alerts",
+      "destination": "/api/train-alerts"
+    },
+    {
+      "source": "/api/lta/bus-stops",
+      "destination": "/api/bus-stops"
+    },
+    {
+      "source": "/api/lta/bus-routes",
+      "destination": "/api/bus-routes"
+    },
+    {
+      "source": "/api/lta/bus-services",
+      "destination": "/api/bus-services"
+    },
+    {
+      "source": "/api/lta/status",
+      "destination": "/api/lta-status"
     }
   ]
 }

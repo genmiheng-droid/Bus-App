@@ -7,6 +7,7 @@ interface SideMenuDrawerProps {
   onClose: () => void;
   currentTab: TabType;
   onSelectTab: (tab: TabType) => void;
+  onOpenBackendStatus?: () => void;
 }
 
 export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
@@ -14,11 +15,13 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   onClose,
   currentTab,
   onSelectTab,
+  onOpenBackendStatus,
 }) => {
   if (!isOpen) return null;
 
   const menuItems: { key: TabType; label: string; icon: string; desc: string }[] = [
     { key: 'arrivals', label: 'Arrivals Dashboard', icon: 'directions_bus', desc: 'Real-time telemetry & occupancy' },
+    { key: 'services', label: 'SBS Fleet Directory', icon: 'grid_view', desc: 'All SBS Transit bus routes & timetables' },
     { key: 'map', label: 'Live Transit Radar', icon: 'map', desc: 'Interactive GPS radar map' },
     { key: 'plan', label: 'Journey Planner', icon: 'route', desc: 'Optimal multi-modal routing' },
     { key: 'alerts', label: 'Network Operations', icon: 'notifications', desc: 'Live alerts & advisories' },
@@ -88,16 +91,29 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
 
         {/* Footer info & Telemetry usage card */}
         <div className="p-6 space-y-4 border-t border-slate-800/60">
-          <div className="bg-slate-800/40 rounded-2xl p-4 border border-slate-700/80">
-            <p className="text-[10px] text-slate-400 uppercase tracking-wider font-bold mb-1.5">
-              Live Telemetry Feed
-            </p>
+          <div
+            onClick={() => {
+              if (onOpenBackendStatus) {
+                onOpenBackendStatus();
+                onClose();
+              }
+            }}
+            className="bg-slate-800/40 hover:bg-slate-800/80 transition-colors rounded-2xl p-4 border border-slate-700/80 cursor-pointer group"
+          >
+            <div className="flex items-center justify-between mb-1.5">
+              <p className="text-[10px] text-slate-400 uppercase tracking-wider font-bold">
+                Live Telemetry Feed
+              </p>
+              <span className="text-[10px] text-indigo-400 font-semibold group-hover:underline">
+                Config
+              </span>
+            </div>
             <div className="w-full bg-slate-700 h-1.5 rounded-full mb-2 overflow-hidden">
-              <div className="bg-indigo-500 w-[88%] h-full rounded-full shadow-glow-indigo" />
+              <div className="bg-indigo-500 w-[95%] h-full rounded-full shadow-glow-indigo" />
             </div>
             <p className="text-[11px] text-slate-300 flex items-center justify-between">
-              <span>LTA DataMall 2.0</span>
-              <span className="text-emerald-400 font-bold">Online</span>
+              <span>LTA DataMall 2.0 (Vercel)</span>
+              <span className="text-emerald-400 font-bold">Live Proxy</span>
             </p>
           </div>
 

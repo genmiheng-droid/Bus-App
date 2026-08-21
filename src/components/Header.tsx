@@ -7,6 +7,7 @@ interface HeaderProps {
   onOpenMenu: () => void;
   onOpenSearch: () => void;
   onSelectTab: (tab: TabType) => void;
+  onOpenBackendStatus?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -14,6 +15,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenMenu,
   onOpenSearch,
   onSelectTab,
+  onOpenBackendStatus,
 }) => {
   return (
     <header className="fixed top-0 w-full z-50 h-20 bg-white border-b border-slate-200 flex items-center justify-between px-4 sm:px-6 md:px-10 transition-colors duration-200">
@@ -83,6 +85,16 @@ export const Header: React.FC<HeaderProps> = ({
           Arrivals
         </button>
         <button
+          onClick={() => onSelectTab('services')}
+          className={`px-3.5 py-1.5 rounded-xl text-xs font-semibold tracking-wide transition-all ${
+            currentTab === 'services'
+              ? 'bg-white text-slate-900 shadow-sm border border-slate-200/80'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
+          }`}
+        >
+          SBS Fleet
+        </button>
+        <button
           onClick={() => onSelectTab('map')}
           className={`px-3.5 py-1.5 rounded-xl text-xs font-semibold tracking-wide transition-all ${
             currentTab === 'map'
@@ -137,13 +149,17 @@ export const Header: React.FC<HeaderProps> = ({
           <div className="absolute top-1.5 right-1.5 w-2 h-2 bg-rose-500 rounded-full ring-2 ring-white" />
         </button>
 
-        {/* Live GPS Telemetry Status Capsule */}
-        <div className="hidden sm:flex items-center gap-2 pl-3 border-l border-slate-200 text-xs font-semibold text-slate-600">
+        {/* Live GPS Telemetry / Backend Status Capsule */}
+        <button
+          onClick={onOpenBackendStatus}
+          title="View LTA API & Vercel backend environment configuration"
+          className="hidden sm:flex items-center gap-2 pl-3 border-l border-slate-200 text-xs font-semibold text-slate-600 hover:text-indigo-600 transition-colors cursor-pointer"
+        >
           <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-          <span className="text-[11px] text-slate-500 uppercase tracking-wider font-bold">
-            Radar Active
+          <span className="text-[11px] text-slate-500 uppercase tracking-wider font-bold hover:text-indigo-600">
+            LTA Live API
           </span>
-        </div>
+        </button>
       </div>
     </header>
   );

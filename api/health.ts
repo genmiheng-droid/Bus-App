@@ -1,13 +1,11 @@
-export default function handler(req: any, res: any) {
-  const accountKey = (
-    process.env.LTA_ACCOUNT_KEY ||
-    process.env.LTA_DATAMALL_ACCOUNT_KEY ||
-    ''
-  ).trim();
+import { getLtaConfigStatus } from '../src/server/ltaService';
 
+export default function handler(req: any, res: any) {
+  const status = getLtaConfigStatus();
   res.status(200).json({
     status: 'ok',
-    ltaConfigured: Boolean(accountKey),
     timestamp: new Date().toISOString(),
+    ltaConfigured: status.configured,
+    environment: status.environment,
   });
 }

@@ -1,4 +1,4 @@
-export type TabType = 'arrivals' | 'plan' | 'map' | 'alerts';
+export type TabType = 'arrivals' | 'plan' | 'map' | 'alerts' | 'services';
 
 export type OccupancyLevel = 'seats' | 'standing' | 'limited';
 
@@ -7,20 +7,70 @@ export interface BusArrival {
   destination: string;
   mins: number;
   nextMins: number;
+  thirdMins?: number;
+  secondsRemaining?: number; // precise countdown in seconds
+  targetArrivalEpoch?: number; // epoch ms for accurate countdown
   occupancy: OccupancyLevel;
   occupancyPercent: number;
   isWheelchairAccessible?: boolean;
   busType?: 'Single' | 'Double Deck' | 'Bendy';
+  operator?: string;
 }
 
 export interface BusStop {
-  id: string;
+  id: string; // 5-digit bus stop code, e.g. '09038', '83139'
   name: string;
   road: string;
   distanceMeters?: number;
   isFavorite?: boolean;
-  coords: { x: number; y: number }; // percentage on map
+  coords: { x: number; y: number }; // percentage on interactive diagram
+  lat: number; // real latitude in Singapore (e.g. 1.300)
+  lng: number; // real longitude in Singapore (e.g. 103.838)
   services: BusArrival[];
+}
+
+export type SBSRouteType =
+  | 'Trunk'
+  | 'Feeder'
+  | 'Townlink'
+  | 'Express'
+  | 'Fast Forward'
+  | 'Nite Owl'
+  | 'Premium'
+  | 'Cross Border'
+  | 'Changi Airport';
+
+export interface SBSServiceInfo {
+  serviceNo: string;
+  routeType: SBSRouteType;
+  origin: string;
+  destination: string;
+  isLoop?: boolean;
+  loopPoint?: string;
+  operatingHours: {
+    weekdays: string;
+    saturdays: string;
+    sundays: string;
+  };
+  headway: {
+    peak: string; // e.g. "4 - 8 mins"
+    offPeak: string; // e.g. "9 - 14 mins"
+  };
+  interchange: string;
+  keyStops: string[];
+  stopsCount: number;
+  operator: 'SBS Transit';
+  description?: string;
+}
+
+export interface UserLocation {
+  lat: number;
+  lng: number;
+  accuracy?: number;
+  isGpsActive: boolean;
+  isLoading: boolean;
+  errorMessage?: string | null;
+  detectedAddress?: string;
 }
 
 export interface RouteSegment {
@@ -61,3 +111,4 @@ export interface ServiceAlert {
   timestamp: string;
   accentColor: string; // e.g. '#bb0013', '#003372', '#f59e0b'
 }
+
