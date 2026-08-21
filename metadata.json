@@ -1,0 +1,6 @@
+{
+  "name": "SBS Transit Live",
+  "description": "Real-time Singapore bus arrivals, interactive live map, route planner, and service alerts dashboard.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
